@@ -1,99 +1,172 @@
+# api_fake.py
 import os
+import json
 import time
 import pandas as pd
 from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
-# ===== Config =====
-API_KEY = os.environ.get("API_KEY", "projetods2025")
-DELAY = float(os.environ.get("DELAY", "0"))
-CSV_URL = os.environ.get("CSV_URL")        # URL direta do CSV (Drive/Dropbox/S3)
-CSV_PATH = os.environ.get("CSV_PATH", "")  # Caminho local do CSV no repo (fallback)
+# =========================
+# Configurações por ambiente
+# =========================
+API_KEY  = os.environ.get("API_KEY", "projetods2025")
+DELAY    = float(os.environ.get("DELAY", "0"))
+CSV_URL  = os.environ.get("CSV_URL")          # URL direta (Dropbox ?dl=1, Supabase, S3 etc.)
+CSV_PATH = os.environ.get("CSV_PATH", "")     # Caminho no repositório (fallback)
+CSV_SEP  = os.environ.get("CSV_SEP")          # Forçar separador (ex.: ";")
+APP_VER  = os.environ.get("APP_VER", "1.0.0")
 
-# cache em memória
+# Cache em memória
 _df_cache = None
 
-def load_df():
-    """Carrega o DataFrame uma única vez (lazy-load) a partir de CSV_URL ou CSV_PATH."""
-    global _df_cache
-    if _df_cache is not None:
-        return _df_cache
 
-    src = CSV_URL or CSV_PATH or "df_t_pequeno.csv"  # fallback seguro
-    app.logger.info(f"Carregando dados de: {src}")
-    try:
-        df = pd.read_csv(src)
-    except Exception as e:
-        app.logger.error(f"Falha ao ler CSV: {e}")
-        df = pd.DataFrame()
-
-    # normalização mínima recomendada
-    if "date_purchase" in df.columns:
-        df["date_purchase"] = pd.to_datetime(df["date_purchase"], errors="coerce").astype(str)
-
-    return set_df_cache(df)
-
-def set_df_cache(df: pd.DataFrame):
+# =========================
+# Utilidades
+# =========================
+def set_df_cache(df):
+    """Atualiza o cache."""
     global _df_cache
     _df_cache = df
     return _df_cache
 
-def require_token():
-    token = request.headers.get("x-api-key")
-    if token != API_KEY:
-        return False
-    return True
 
-def coerce_cols(df: pd.DataFrame, cols_param: str):
-    """Valida e seleciona colunas solicitadas via ?cols=col1,col2,..."""
+def require_token():
+    """Autenticação simples via header x-api-key."""
+    token = request.headers.get("x-api-key")
+    return token == API_KEY
+
+
+def _read_csv_robusto(src: str) -> pd.DataFrame:
+    """
+    Leitura à prova de CSV:
+      - aceita .csv e .csv.gz (compression='infer')
+      - tenta autodetectar separador
+      - permite forçar separador por env CSV_SEP
+      - ignora linhas malformadas (on_bad_lines='skip')
+    """
+    read_common = dict(
+        low_memory=False,
+        encoding="utf-8",
+        compression="infer",
+        on_bad_lines="skip",
+    )
+
+    tentativas = []
+    # 1) se usuário informou separador
+    if CSV_SEP:
+        tentativas.append({"sep": CSV_SEP, "engine": "python"})
+    # 2) autodetecta
+    tentativas.append({"sep": None, "engine": "python"})
+    # 3) tentativas comuns
+    tentativas.append({"sep": ";", "engine": "python"})
+    tentativas.append({"sep": ",", "engine": "c"})
+
+    ultimo_erro = None
+    for opt in tentativas:
+        try:
+            df = pd.read_csv(src, **read_common, **opt)
+            app.logger.info(f"[CSV] OK sep={opt['sep']} engine={opt['engine']} shape={df.shape}")
+            return df
+        except Exception as e:
+            ultimo_erro = e
+            app.logger.warning(f"[CSV] Falhou sep={opt['sep']} engine={opt['engine']}: {e}")
+
+    app.logger.error(f"[CSV] Falha final ao ler {src}: {ultimo_erro}")
+    return pd.DataFrame()
+
+
+def load_df() -> pd.DataFrame:
+    """Carrega DataFrame (lazy-load)."""
+    global _df_cache
+    if _df_cache is not None:
+        return _df_cache
+
+    src = CSV_URL or CSV_PATH or "df_t_pequeno.csv"
+    app.logger.info(f"Carregando dados de: {src}")
+    df = _read_csv_robusto(src)
+
+    # Normalizações leves e seguras
+    if not df.empty:
+        if "date_purchase" in df.columns:
+            df["date_purchase"] = pd.to_datetime(df["date_purchase"], errors="coerce").astype(str)
+
+        if "gmv_success" in df.columns and df["gmv_success"].dtype == object:
+            # troca vírgula por ponto se vier no padrão PT-BR
+            df["gmv_success"] = pd.to_numeric(
+                df["gmv_success"].astype(str).str.replace(",", ".", regex=False),
+                errors="coerce"
+            )
+
+        if "total_tickets_quantity_success" in df.columns:
+            df["total_tickets_quantity_success"] = pd.to_numeric(
+                df["total_tickets_quantity_success"], errors="coerce"
+            ).astype("Int64")
+
+    return set_df_cache(df)
+
+
+def coerce_cols(df: pd.DataFrame, cols_param: str) -> pd.DataFrame:
+    """Seleciona apenas as colunas pedidas em ?cols=a,b,c."""
     if not cols_param:
         return df
-    requested = [c.strip() for c in cols_param.split(",") if c.strip()]
-    valid = [c for c in requested if c in df.columns]
-    return df[valid]
+    req = [c.strip() for c in cols_param.split(",") if c.strip()]
+    keep = [c for c in req if c in df.columns]
+    return df[keep]
 
+
+# =========================
+# Rotas
+# =========================
 @app.route("/")
-def home():
-    return jsonify({"status": "ok", "msg": "API Fake ClickBus rodando"})
+def root():
+    return jsonify({"status": "ok", "service": "API Fake ClickBus"})
 
-# ===== Novo: schema para ajudar a criar tabela no banco =====
+
+@app.route("/health")
+def health():
+    try:
+        df = load_df()
+        return jsonify({"status": "ok", "rows": int(len(df))})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/version")
+def version():
+    return jsonify({"version": APP_VER})
+
+
 @app.route("/schema", methods=["GET"])
 def schema():
     if not require_token():
         return jsonify({"erro": "Acesso não autorizado"}), 401
-
     if DELAY:
         time.sleep(DELAY)
 
     df = load_df()
+    mapping = {
+        "object": "string",
+        "float64": "float",
+        "int64": "int",
+        "Int64": "int",
+        "bool": "bool",
+        "datetime64[ns]": "datetime",
+    }
+    cols = [{"name": n, "type": mapping.get(str(t), str(t))} for n, t in df.dtypes.items()]
+    return jsonify({"columns": cols, "count": int(len(df))})
 
-    # monta tipos "simples" (str -> string, float64 -> float, int64 -> int)
-    mapping = {"object": "string", "float64": "float", "int64": "int", "bool": "bool", "datetime64[ns]": "datetime"}
-    cols = []
-    for name, dtype in df.dtypes.items():
-        cols.append({
-            "name": name,
-            "type": mapping.get(str(dtype), str(dtype))
-        })
 
-    return jsonify({
-        "columns": cols,
-        "count": int(len(df))
-    })
-
-# ===== Dados com filtros, seleção de colunas e paginação =====
 @app.route("/dados", methods=["GET"])
-def get_dados():
+def dados():
     if not require_token():
         return jsonify({"erro": "Acesso não autorizado"}), 401
-
     if DELAY:
         time.sleep(DELAY)
 
     df = load_df().copy()
 
-    # filtros existentes
+    # Filtros
     cliente = request.args.get("cliente")
     data = request.args.get("data")  # prefixo YYYY-MM
 
@@ -103,12 +176,12 @@ def get_dados():
     if data and "date_purchase" in df.columns:
         df = df[df["date_purchase"].str.startswith(data)]
 
-    # ===== novo: selecionar colunas =====
-    cols = request.args.get("cols")  # ex.: fk_contact,date_purchase,gmv_success
+    # Seleção de colunas
+    cols = request.args.get("cols")
     if cols:
         df = coerce_cols(df, cols)
 
-    # ===== novo: paginação simples =====
+    # Paginação
     try:
         limit = int(request.args.get("limit", "0"))
     except ValueError:
@@ -123,19 +196,17 @@ def get_dados():
     if limit > 0:
         df = df.iloc[:limit]
 
-    # ===== novo: formato NDJSON para ingestão em DBs =====
+    # Formatos
     fmt = request.args.get("format", "json").lower()
     if fmt == "ndjson":
-        # cada linha é um registro JSON; ideal para pipelines/ingestores
         def gen():
             for rec in df.to_dict(orient="records"):
-                yield pd.io.json.dumps(rec, ensure_ascii=False) + "\n"
+                yield json.dumps(rec, ensure_ascii=False) + "\n"
         return Response(gen(), mimetype="application/x-ndjson")
 
-    # padrão: JSON array
     return jsonify(df.to_dict(orient="records"))
 
-# ===== (Opcional) recarregar cache após trocar CSV_URL/CSV_PATH =====
+
 @app.route("/reload", methods=["POST"])
 def reload():
     if not require_token():
@@ -144,7 +215,11 @@ def reload():
     load_df()
     return jsonify({"status": "ok", "msg": "Dados recarregados"})
 
+
+# =========================
+# Main (local) / Render
+# =========================
 if __name__ == "__main__":
-    # Render: escutar na porta do ENV e no host 0.0.0.0
+    # No Render, ele define PORT; local usa 5000
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
